@@ -48,6 +48,14 @@ struct IO {
     }
 };
 int main() {
+    // Native hwSetInterruptState's software VBL bit (bit3) must follow the
+    // hardware IER VBL bit while preserving transaction bits. logFBState uses
+    // this word to detect "Flip called without enabling VBL".
+    assert(vblSoftwareState(0,1)==8);
+    assert(vblSoftwareState(1,1)==9);
+    assert(vblSoftwareState(0x101,0)==0x101);
+    assert(vblSoftwareState(0x109,0)==0x101);
+    assert(vblSoftwareState(0x109,1)==0x109);
     // DSI0 can feed A/B/C. IRQ/frame/plane banks follow the pipe, while
     // control/function come from DSI0. Keep external A active for B/C cases.
     for(unsigned pipe=0;pipe<3;++pipe) {
