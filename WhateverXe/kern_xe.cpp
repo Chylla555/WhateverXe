@@ -4695,6 +4695,10 @@ struct Display13FBGTTContext {
 	bool initialized {},faulted {};uint32_t reads {};
 };
 static Display13FBGTTContext display13FBGTT;
+// The framebuffer controller whose native start completed. Accelerator
+// registration needs a started controller and the shared-memory contract, not
+// the display-path acceptance verdict (watermarks/IRQ stay display concerns).
+static IOService *display13FBStartedController {};
 struct Display13FBSysMemSlot {
 	IOBufferMemoryDescriptor *buffer {};
 	IOMemoryDescriptor *scratch {};
@@ -4878,9 +4882,41 @@ static void adlnIRQCache(IOService *controller,Display13FBIRQIO &io) {
 	c[0xFD4]=s.enabled && !s.faulted ? 2 : 0;
 	const auto wells=io.read(Display13FBIRQ::Driver);
 	for(unsigned p=0;p<3;++p)if((s.configured&(1U<<p)) && !(display13FBIRQ.blockedPipes&(1U<<p)) && Display13FBIRQ::powered(wells,p)) {
-		*reinterpret_cast<uint32_t *>(c+0xD88+8*p)=io.read(Display13FBIRQ::PipeIIR(p)+4);
+		const auto ier=io.read(Display13FBIRQ::PipeIIR(p)+4);
+		*reinterpret_cast<uint32_t *>(c+0xD88+8*p)=ier;
 		*reinterpret_cast<uint32_t *>(c+0xD8C+8*p)=io.read(Display13FBIRQ::PipeIIR(p)-4);
+		// Native hwSetInterruptState mirrors the VBL enable into this per-pipe
+		// software interrupt word. This backend arms the bank directly instead
+		// of calling it, so logFBState would otherwise report "Flip called
+		// without enabling VBL" although the hardware VBL is running. Preserve
+		// every other transaction bit and only track VBL (bit 3).
+		auto *software=reinterpret_cast<uint32_t *>(c+0xE14+4*p);
+		*software=Display13FBIRQ::vblSoftwareState(*software,ier);
 	}
+}
+// Native setInterruptState marks the per-pipe transaction word (bit 3) before
+// the first flip, so logFBState sees an enabled VBL. This backend arms VBL in
+// hwConfigureVBLInterrupt, which runs inside PreProcessTransaction after
+// logFBState has already sampled the word. Mark the same transaction boundary
+// before the native flip body so the first flip after a modeset is not
+// reported as missing VBL. Only the marker is written; native transaction
+// paths still clear it when their own state is empty.
+static void adlnSyncFlipVBL(IOService *fb) {
+	auto &c=display13FBIRQ;
+	if(!fb || !c.base || !c.controller)return;
+	if(fb->getMetaClass()->getClassSize()<0x4B90)return;
+	auto controller=Display13FBMemory::field<IOService *>(fb,0x1D0);
+	if(!adlnIRQOwner(controller))return;
+	const auto offset=Display13FBMemory::pathCountOffset(fb);
+	if(!offset || Display13FBMemory::field<uint32_t>(fb,offset)!=1)return;
+	auto path=Display13FBMemory::field<OSObject *>(fb,offset+8);
+	if(!path || path->getMetaClass()->getClassSize()<0x3730)return;
+	const auto pipe=Display13FBMemory::field<uint32_t>(path,0x3640);
+	if(pipe>=3)return;
+	Display13FBIRQIO io {c.base};
+	if(!Display13FBIRQ::powered(io.read(Display13FBIRQ::Driver),pipe))return;
+	auto *software=reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(controller)+0xE14+4*pipe);
+	__atomic_fetch_or(software,8U,__ATOMIC_RELAXED);
 }
 static void adlnIRQRecord(uint64_t (&r)[32],unsigned event) {
 	auto &c=display13FBIRQ;auto &s=c.state;
@@ -5326,6 +5362,15 @@ bool XE::processDisplay13Framebuffer(KernelPatcher &patcher,size_t index,mach_vm
 	known=known && !memcmp(reinterpret_cast<void *>(address+0x59D8E),objectSize,sizeof(objectSize)) &&
 		!memcmp(reinterpret_cast<void *>(address+0x3FE26),ownerStore,sizeof(ownerStore));
 	if(!known)return false;
+	// displaypolicyd substitutes its static "Color LCD" fallback EDID whenever
+	// GetLinkConfig reports the built-in-port hint, so the real panel EDID is
+	// never read on this machine. Route the query independently of the later
+	// hardware hook groups and clear only that hint in wrapTGLLinkConfig; the
+	// EDID read and every other AGDC field stay native.
+	KernelPatcher::RouteRequest linkConfig("__ZN31AppleIntelFramebufferController13GetLinkConfigEP16AGDCLinkConfig_tS1_",wrapTGLLinkConfig,orgTGLLinkConfig);
+	display13FBLinkConfigHookReady=patcher.routeMultiple(index,&linkConfig,1,address,size);
+	patcher.clearError();
+	IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13LinkConfigReady",display13FBLinkConfigHookReady);
 	if(!display13FBPower.lock)display13FBPower.lock=IOLockAlloc();
  // Apply DVMT calculation before routing FBMemMgr_Init: the common
  // module scans its native entry, not our later trampoline. Startup is
@@ -5491,6 +5536,8 @@ bool XE::processDisplay13Framebuffer(KernelPatcher &patcher,size_t index,mach_vm
 
 	display13FBIRQReady=processDisplay13FramebufferIRQ(patcher,index,address,size);
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FBIRQHooksReady",display13FBIRQReady);
+	display13FBFlipSyncReady=!adlnOutputWiring.dsi && processDisplay13FramebufferFlipSync(patcher,index,address,size);
+	IORegistryEntry::getRegistryRoot()->setProperty("N97FBFlipSyncReady",display13FBFlipSyncReady);
 	display13FBABIReady=framebufferDonorCommonReady;
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FBCommonABIReady",display13FBABIReady);
 	display13FBLifecycleHooksReady=processDisplay13FramebufferLifecycle(patcher,index,address,size);
@@ -6014,6 +6061,19 @@ bool XE::processDisplay13FramebufferIRQ(KernelPatcher &patcher,size_t index,mach
 	KernelPatcher::RouteRequest swRoute {swSymbol,wrapDisplay13FBSWIRQ,orgDisplay13FBSWIRQ};
 	const bool swRouted=routed && patcher.routeMultipleShort(index,&swRoute,1,address,size);
 	patcher.clearError();return swRouted;
+}
+
+bool XE::processDisplay13FramebufferFlipSync(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+	// Non-DSI scanout still enters the native flip body. Its logFBState call
+	// samples the per-pipe transaction word before PreProcessTransaction arms
+	// VBL, so mirror the native setInterruptState marker at this boundary.
+	if(!display13FramebufferRequested || size<0x2B613)return false;
+	const char *symbol="__ZN21AppleIntelFramebuffer22PerformFlipTransactionEP30IOAccelDisplayPipeTransaction2yP21FlipTransactionParams";
+	const uint8_t entry[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xEC,0x48};
+	const auto fn=patcher.solveSymbol<mach_vm_address_t>(index,symbol,address,size);patcher.clearError();
+	if(fn!=address+0x2B602 || memcmp(reinterpret_cast<void *>(fn),entry,sizeof(entry)))return false;
+	KernelPatcher::RouteRequest route {symbol,wrapDSIFlipTransaction,orgDSITransaction[0]};
+	const bool ready=patcher.routeMultiple(index,&route,1,address,size);patcher.clearError();return ready;
 }
 
 IOReturn XE::wrapDisplay13FBEnableIRQ(IOService *controller) {
@@ -7542,9 +7602,44 @@ bool XE::processDisplay13FramebufferSST(KernelPatcher &patcher,size_t index,mach
  return display13FBSSTHooksReady;
 }
 
+// Read-only diagnostic evaluated under the display owner lock. One bit per
+// display13SSTPort rejection so a boot-adoption failure remains observable.
+void XE::display13SSTPortRecord(void *port,bool unprobed) {
+ auto s=callbackXE;auto &c=display13FBPower;auto object=static_cast<OSObject *>(port);
+ uint64_t r[14] {1};uint64_t &f=r[1];
+ if(!s->display13FramebufferRequested)f|=1;
+ if(s->xeProfile.display!=XELP::Display::XeLPD)f|=2;
+ if(!s->display13FBSSTHooksReady)f|=4;
+ if(!object || object->getMetaClass()->getClassSize()<0x624)f|=8;
+ if(!c.controller || c.controller!=s->adlnTopologyController)f|=0x10;
+ if(!adlnWriterMappingBound())f|=0x20;
+ if(c.clockFaulted)f|=0x40;
+ if(c.memoryFaulted)f|=0x80;
+ if(c.panelFaulted)f|=0x100;
+ if(c.clockStopped)f|=0x200;
+ if(!s->adlnOutputWiring.described())f|=0x400;
+ if(!(f&8)) {
+  auto p=static_cast<uint8_t *>(port);auto config=Display13FBMemory::field<uint32_t *>(p,0x548);
+  if(!Display13FBTopology::selected(s->adlnPlatform,config,s->adlnOutputWiring))f|=0x800;
+  if(config && !(s->adlnOutputWiring.links()&(1U<<config[0])))f|=0x1000;
+  if(p[0x117])f|=0x2000;
+  if(config && Display13FBMemory::field<uint32_t>(p,0x120)!=config[0])f|=0x4000;
+  if(Display13FBMemory::field<void *>(p,0x578)!=c.access)f|=0x8000;
+  const auto mode=Display13FBMemory::field<uint32_t>(p,0x550);
+  const auto expected=config && config[0]>=3?((s->adlnOutputWiring.typeC&(1U<<config[0]))?3U:4U):1U;
+  if(config && mode!=expected && !(unprobed && config[0]<3 && !mode))f|=0x10000;
+  r[2]=config?config[0]:UINT64_MAX;r[3]=p[0x117];r[4]=Display13FBMemory::field<uint32_t>(p,0x120);
+  r[5]=mode;r[6]=Display13FBMemory::field<uint32_t>(p,0x554);r[7]=p[0x115];
+  r[8]=Display13FBMemory::field<uint32_t>(p,0x124);r[9]=Display13FBMemory::field<uint32_t>(p,0x128);
+  r[10]=unprobed;r[11]=s->adlnOutputWiring.links();
+  if(config){r[12]=(uint64_t(config[1])<<32)|config[2];r[13]=(uint64_t(config[4])<<32)|config[5];}
+ }
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13SSTPortReject",r,sizeof(r));
+}
+
 // Called with the display owner lock held. The native caller owns the port;
 // require its retained platform record and BAR association before sampling it.
-uint8_t *XE::display13SSTPort(void *port) {
+uint8_t *XE::display13SSTPort(void *port,bool unprobed) {
  auto s=callbackXE;auto &c=display13FBPower;auto object=static_cast<OSObject *>(port);
  if(!s->display13FramebufferRequested || s->xeProfile.display!=XELP::Display::XeLPD || !s->display13FBSSTHooksReady ||
     !object || object->getMetaClass()->getClassSize()<0x624 || !c.controller ||
@@ -7553,8 +7648,14 @@ uint8_t *XE::display13SSTPort(void *port) {
  auto p=static_cast<uint8_t *>(port);auto config=Display13FBMemory::field<uint32_t *>(p,0x548);
  if(!Display13FBTopology::selected(s->adlnPlatform,config,s->adlnOutputWiring) ||
     !(s->adlnOutputWiring.links()&(1U<<config[0])) || p[0x117] ||
-    Display13FBMemory::field<uint32_t>(p,0x120)!=config[0] || Display13FBMemory::field<uint32_t>(p,0x550)!=(config[0]>=3?((s->adlnOutputWiring.typeC&(1U<<config[0]))?3U:4U):1U) ||
-    Display13FBMemory::field<void *>(p,0x578)!=c.access)return nullptr;
+    Display13FBMemory::field<uint32_t>(p,0x120)!=config[0] ||
+    (Display13FBMemory::field<uint32_t>(p,0x550)!=(config[0]>=3?((s->adlnOutputWiring.typeC&(1U<<config[0]))?3U:4U):1U) && !(config[0]<3 && !Display13FBMemory::field<uint32_t>(p,0x550) && (s->adlnOutputWiring.panel&(1U<<config[0])))) ||
+    Display13FBMemory::field<void *>(p,0x578)!=c.access)return nullptr; // vbtfix: eDP mode 0 before setPortMode
+ const auto mode=Display13FBMemory::field<uint32_t>(p,0x550);
+ const auto expected=config[0]>=3?((s->adlnOutputWiring.typeC&(1U<<config[0]))?3U:4U):1U;
+ // Boot adoption runs before the first probePortMode; a Combo port is then
+ // still mode 0. Every AUX/training user requires the probed mode.
+ if(mode!=expected && !(unprobed && config[0]<3 && !mode))return nullptr;
  return p;
 }
 
@@ -8342,8 +8443,29 @@ bool XE::wrapDisplay13FramebufferStart(IOService *that,IOService *provider) {
 	SYSLOG("igfx","Display13 native controller start enter offline=%u",display13Offline);
 	const auto started=FunctionCast(wrapDisplay13FramebufferStart,s->orgFramebufferStart)(that,provider);
 	SYSLOG("igfx","Display13 native controller start return=%u",started);
+	if(started)__atomic_store_n(&display13FBStartedController,that,__ATOMIC_RELEASE);
 	that->setProperty("N97FramebufferOriginalStart",started);
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FramebufferOriginalStart",started);
+	// hwInitializeLatencyValues can run before the power bridge and watermark
+	// backends are registered, leaving the latency snapshot NotAdmitted. The
+	// native start has completed by now, so take one fresh qualified sample
+	// instead of rejecting the controller on a stale early read.
+	if(started && display13FBPower.lock && display13FBPower.map &&
+		display13FBPower.bridge.begun && !display13FBPower.bridge.state.faulted &&
+		!display13FBPower.clockFaulted && !display13FBPower.watermarkFaulted &&
+		display13FBPower.latency.status!=Display13WM::Status::Complete) {
+		IOLockLock(display13FBPower.lock);
+		if(display13FBPower.bridge.begun && !display13FBPower.bridge.state.faulted &&
+			!display13FBPower.clockFaulted && !display13FBPower.watermarkFaulted &&
+			display13FBPower.latency.status!=Display13WM::Status::Complete) {
+			Display13FBClockIO io {display13FBPower.map};
+			display13FBPower.latency=Display13WM::queryLatency(io);
+			if(display13FBPower.latency.status==Display13WM::Status::Complete)
+				for(unsigned i=0;i<8;++i)*reinterpret_cast<uint32_t *>(
+					reinterpret_cast<uint8_t *>(that)+0x1960+4*i)=i<6 ? display13FBPower.latency.us[i] : 0;
+		}
+		IOLockUnlock(display13FBPower.lock);
+	}
 	bool irqEnabled=false;
 	if(adlnIRQOwner(that)) {
 		const auto saved=IOSimpleLockLockDisableInterrupt(display13FBIRQ.lock);
@@ -8354,6 +8476,16 @@ bool XE::wrapDisplay13FramebufferStart(IOService *that,IOService *provider) {
 		!display13FBPower.clockFaulted && !display13FBPower.memoryFaulted && display13FBPower.engineEnabled &&
 		!display13FBPower.dbuf.faulted && !display13FBPower.dbuf.updating && !display13FBPower.watermarkFaulted &&
 		display13FBPower.latency.status==Display13WM::Status::Complete;
+	uint64_t startBits[] {1,started,irqEnabled,display13FBPower.bridge.begun,display13FBPower.bridge.bootAdopted,
+		!display13FBPower.bridge.state.faulted,!display13FBPower.clockFaulted,!display13FBPower.memoryFaulted,
+		display13FBPower.engineEnabled,!display13FBPower.dbuf.faulted,!display13FBPower.dbuf.updating,
+		!display13FBPower.watermarkFaulted,display13FBPower.latency.status==Display13WM::Status::Complete,
+		static_cast<uint32_t>(display13FBPower.latency.status),display13FBPower.bridge.state.suspended,
+		display13FBPower.latency.us[0]};
+	uint32_t startMask=0;for(unsigned i=1;i<13;++i)if(startBits[i])startMask|=1U<<(i-1);
+	that->setProperty("N97FramebufferStartPrerequisites",startBits,sizeof(startBits));
+	if(provider)provider->setProperty("WEXDisplayStartPrerequisites",startBits,sizeof(startBits));
+	if(started && !accepted)SYSLOG("igfx","Display13 start rejected mask=0x%x latency=%u",startMask,(unsigned)display13FBPower.latency.status);
 	if(accepted) {
   s->tglObservationController=that;
   uint64_t shared[] {1,Display13FBMemory::field<uint32_t>(that,0xDF8),Display13FBMemory::field<uint64_t>(that,0xDC0),
@@ -8369,6 +8501,32 @@ bool XE::wrapDisplay13FramebufferStart(IOService *that,IOService *provider) {
 	return accepted;
 }
 
+
+// Read-only diagnostic for the Combo boot-adoption transaction. One bit per
+// adoptDPBootAUX precondition that fails.
+template<class IO> static void display13ComboAdoptRecord(void *port,IO &io,const AlderLakeN::DisplayReadout &boot,unsigned ddi,bool panel) {
+ auto &c=display13FBPower;auto &b=c.bridge;auto &link=c.mainLink[ddi];
+ uint64_t r[12] {1};uint64_t &f=r[1];
+ if(!port)f|=1;
+ if(boot.activePipes!=1)f|=2;
+ if(!AlderLakeN::dpSource(boot,0,ddi,nullptr,panel))f|=4;
+ if(!AlderLakeN::dpSourceUnchanged(io,boot,0,ddi,0,nullptr,panel))f|=8;
+ if(b.bootPort!=ddi)f|=0x10;
+ if(b.bootAdopted)f|=0x20;
+ if(!b.bootPGProtected)f|=0x40;
+ if(!b.bootDDIProtected)f|=0x80;
+ if(!b.outputHeld(io,ddi,0))f|=0x100;
+ if(!link.bootPending)f|=0x200;
+ if(link.owner)f|=0x400;
+ if(link.port!=ddi)f|=0x800;
+ if(link.lease.owner!=&b.state)f|=0x1000;
+ if(link.lease.domains!=Display13Power::dependencies(Display13Power::auxDomain(ddi)))f|=0x2000;
+ if(!Display13Power::held(io,b.state,link.lease.domains))f|=0x4000;
+ r[2]=boot.activePipes;r[3]=boot.poweredPipes;r[4]=static_cast<uint32_t>(boot.status);
+ r[5]=link.port;r[6]=link.lease.domains;r[7]=io.read(Display13Power::AUX);
+ r[8]=io.read(0x45404);r[9]=io.read(0x45454);r[10]=ddi;r[11]=panel;
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13ComboAdopt",r,sizeof(r));
+}
 
 void XE::wrapAlderLakeNSetupWorkLoop(IOService *controller,IOWorkLoop *workLoop) {
 	FunctionCast(wrapAlderLakeNSetupWorkLoop,callbackXE->orgAlderLakeNSetupWorkLoop)(controller,workLoop);
@@ -8480,8 +8638,14 @@ void XE::wrapAlderLakeNSetupWorkLoop(IOService *controller,IOWorkLoop *workLoop)
 			if(!c.bridge.bootAdopted) {
                 const auto ddi=c.bridge.bootPort;
                 const bool dp=ddi<7 && (callbackXE->adlnOutputWiring.links()&(1U<<ddi));
+                // The firmware Combo port has not run probePortMode yet, so its
+                // mode is still 0 at handoff. Admit only that pre-probe state;
+                // every later AUX/training user still requires the probed mode.
+                const bool comboBoot=ddi<2;
+                const bool panel=(callbackXE->adlnOutputWiring.panel&(1U<<ddi))!=0;
                 bool linked=!dp;
-                if(dp && display13SSTPort(port)) {
+                if(dp && !display13SSTPort(port,comboBoot))display13SSTPortRecord(port,comboBoot);
+                if(dp && display13SSTPort(port,comboBoot)) {
                     Display13FBBootIO io{c.map};auto &boot=c.displayScratch;AlderLakeN::readDisplay(io,true,boot);
                     if(ddi>=3) {
                         const auto source=Display13TC::Boot::capture(io,true,ddi,0);
@@ -8489,7 +8653,8 @@ void XE::wrapAlderLakeNSetupWorkLoop(IOService *controller,IOWorkLoop *workLoop)
                         linked=tc.owned(ddi) && tc.linkHeld() && boot.activePipes==1 &&
                             AlderLakeN::dpSourceUnchanged(io,boot,0,ddi,0,&source);
                     } else if(ddi<2) {
-                        result=AlderLakeN::adoptDPBootAUX(io,boot,c.bridge,c.mainLink[ddi],reinterpret_cast<uintptr_t>(port),ddi,(callbackXE->adlnOutputWiring.panel&(1U<<ddi))!=0);
+                        display13ComboAdoptRecord(port,io,boot,ddi,panel);
+                        result=AlderLakeN::adoptDPBootAUX(io,boot,c.bridge,c.mainLink[ddi],reinterpret_cast<uintptr_t>(port),ddi,panel);
                         linked=result.status==Display13Power::Status::Complete;
                         if(linked)port->retain(); // Released only after real buffer stop/idle.
                     }
@@ -9152,7 +9317,7 @@ void XE::adlnSetDualClock(IOService *controller,uint64_t nativeHz) {
             evidence[7]=reinterpret_cast<bool (*)(const IOWorkLoop *)>(callbackXE->adlnWorkLoopInGate)(loop);
             if(!evidence[7]) {
                 ready=reinterpret_cast<bool (*)(IOWorkLoop *)>(callbackXE->adlnWorkLoopTryClose)(loop);
-                if(ready) {acquired=loop;evidence[8]=1;}
+                if(ready) {acquired=loop;evidence[8]=1;} else if(!active) {ready=true;evidence[8]=2;} // vbtfix: cold CDCLK start, no active pipe
             }
         }
         if(ready)for(unsigned p=0;p<3;++p)if(active&(1U<<p)) {
@@ -13292,7 +13457,9 @@ uint32_t XE::wrapDisplay13PanelPower(void *controller,uint32_t state) {
   ok=ok && status!=UINT32_MAX && (state==2 ? (status&0x80000000U)!=0 : !(status&0x80000000U));
   ok=display13PanelPowerReference(false) && ok;
  }
- if(!ok)c.panelFaulted=true;
+ // A pre-bind call can legitimately miss the panel target; that is not a
+ // hardware fault. Only poison the panel after we actually owned PG1.
+ if(owned && !ok)c.panelFaulted=true;
  IOLockUnlock(c.lock);IOLockUnlock(c.panelLock);
  return ok?result:uint32_t(kIOReturnNotReady);
 }
@@ -14410,17 +14577,26 @@ bool XE::wrapTGLAcceleratorRegister(IOService *that) {
 	tglObserveAccelerator(that, 4, false, 0, 0);
 	auto controller=display13FBGTT.controller;
 	if(callbackXE->adlnDetected) {
-	 const bool ready=controller && controller==callbackXE->tglObservationController && adlnSharedCallback &&
+	 const bool startedController=controller && (controller==callbackXE->tglObservationController ||
+	  controller==__atomic_load_n(&display13FBStartedController,__ATOMIC_ACQUIRE));
+	 const bool ready=controller && startedController && adlnSharedCallback &&
 	  that->getMetaClass()->getClassSize()>=0x1400 && controller->getProvider()==that->getProvider() &&
 	  !Display13FBMemory::field<uintptr_t>(controller,0xC0) && !adlnSharedOwner &&
 	  display13FBGTT.initialized && !display13FBGTT.faulted && !display13FBPower.memoryFaulted &&
 	  Display13FBMemory::field<uint32_t>(controller,0xDF8)>=xelpMemory.minimumReservation();
-	 uint64_t before[] {1,ready,controller==callbackXE->tglObservationController,adlnSharedCallback,
+	 uint64_t before[] {1,ready,startedController,adlnSharedCallback,
   that->getMetaClass()->getClassSize(),controller ? uint64_t(controller->getProvider()==that->getProvider()) : 0,
   controller ? Display13FBMemory::field<uintptr_t>(controller,0xC0) : 0,
-  controller ? Display13FBMemory::field<uint32_t>(controller,0xDF8) : 0,display13FBGTT.initialized,display13FBGTT.faulted,display13FBPower.memoryFaulted};
- IORegistryEntry::getRegistryRoot()->setProperty("N97SharedRegisterCheck",before,sizeof(before));
- IORegistryEntry::getRegistryRoot()->setProperty("N97SharedRegisterPrerequisites",ready);
+  controller ? Display13FBMemory::field<uint32_t>(controller,0xDF8) : 0,display13FBGTT.initialized,display13FBGTT.faulted,display13FBPower.memoryFaulted,
+  controller && controller==callbackXE->tglObservationController,controller==__atomic_load_n(&display13FBStartedController,__ATOMIC_ACQUIRE),
+  xelpMemory.minimumReservation(),controller==display13FBGTT.controller};
+  IORegistryEntry::getRegistryRoot()->setProperty("N97SharedRegisterCheck",before,sizeof(before));
+  IORegistryEntry::getRegistryRoot()->setProperty("N97SharedRegisterPrerequisites",ready);
+  if(auto pci=OSDynamicCast(IOPCIDevice,that->getProvider()))pci->setProperty("WEXAccelRegisterCheck",before,sizeof(before));
+  if(!ready)SYSLOG("igfx","TGL accelerator register rejected started=%u shared=%u gtt=%u fault=%u df8=%llx min=%llx",
+   startedController,adlnSharedCallback!=0,display13FBGTT.initialized,display13FBGTT.faulted|display13FBPower.memoryFaulted,
+   static_cast<unsigned long long>(controller ? Display13FBMemory::field<uint32_t>(controller,0xDF8) : 0),
+   static_cast<unsigned long long>(xelpMemory.minimumReservation()));
 	 if(!ready)return false;
 	 __atomic_store_n(&adlnSharedOwner,that,__ATOMIC_RELEASE);
 	}
@@ -17383,6 +17559,19 @@ uint32_t XE::wrapTGLLinkConfig(void *controller, void *request, void *output) {
 	tglTrace(9, id, false, output != nullptr, 0, 0, 0);
 	const auto r = FunctionCast(wrapTGLLinkConfig, callbackXE->orgTGLLinkConfig)(controller, request, output);
 	tglTrace(9, id, true, output != nullptr, 0, r, 0);
+	// Output byte 8 bit 2 is the built-in port hint. Display13 sets it for the
+	// internal panel on framebuffer 0, and displaypolicyd then enables its
+	// cached built-in EDID instead of issuing the real DDC read. Clear only
+	// that bit so the panel is still enumerated but the native EDID is read.
+	if (r == 0 && output && callbackXE->display13FramebufferRequested) {
+		auto record = static_cast<uint8_t *>(output);
+		const bool builtIn = (record[8] & 0x04) != 0;
+		record[8] &= static_cast<uint8_t>(~0x04);
+		uint64_t hint[] {id, builtIn, record[8],
+			*reinterpret_cast<uint32_t *>(record + 0xA4),
+			*reinterpret_cast<uint32_t *>(record + 0xAC)};
+		IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13LinkConfig",hint,sizeof(hint));
+	}
 	return r;
 }
 
@@ -18242,6 +18431,12 @@ bool XE::wrapTGLAllocatePathResources(void *fb, uint32_t portIndex, uint32_t str
 	auto caller = __builtin_return_address(0);
 	tglObserveResource(fb, nullptr, 9, false, 0, portIndex, stream, caller);
 	auto s = callbackXE;
+	// Native start initializes controller+0xE60 to its own fixed PWM period,
+	// while hwGetCRTC (reached from allocateDisplayPathResources below) compares
+	// that field against EFI's live 0xC8254. Capture the panel period here, before
+	// the native allocation reads it, instead of waiting for LightUpEDP.
+	if(s->adlnOutputWiring.panel && (s->adlnOutputWiring.panel&(1U<<portIndex)) && display13FBPower.controller)
+		display13PanelCapture(display13FBPower.controller);
 	bool adopting = false, claimed = false;
 	auto selected = tglTrainingLeaseForDDI(portIndex);
 	if (s->tglTrainingLeaseReady) {

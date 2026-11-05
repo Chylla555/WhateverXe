@@ -74,6 +74,7 @@ int XE::beginDSIFramebufferWriter(IOService *fb) {
 }
 
 uint32_t XE::wrapDSIFlipTransaction(IOService *fb,void *transaction,uint64_t options,void *params) {
+    adlnSyncFlipVBL(fb);
     const int token=beginDSIFramebufferWriter(fb);if(token<0)return kIOReturnNotReady;
     const auto result=FunctionCast(wrapDSIFlipTransaction,callbackXE->orgDSITransaction[0])(fb,transaction,options,params);
     endDSINativeWriter(token);return result;

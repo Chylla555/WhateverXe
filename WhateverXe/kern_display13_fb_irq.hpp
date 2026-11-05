@@ -75,6 +75,12 @@ template<class IO> ActivePipes readActivePipes(IO &io,uint32_t allowed,const Dis
     }
     r.status=r.active && !(r.active&~allowed) ? Status::Complete : Status::Topology;return r;
 }
+// Native hwSetInterruptState keeps VBL (bit3) in the controller's per-pipe
+// software interrupt word in sync with the hardware IER VBL bit. This backend
+// programs the bank directly, so mirror the same invariant explicitly.
+inline uint32_t vblSoftwareState(uint32_t software,uint32_t ier) {
+    return (ier&1) ? (software|8U) : (software&~8U);
+}
 inline uint32_t nativePipe(uint32_t raw,unsigned pipe) {
     if(pipe>=3)return 0;
     uint32_t result=0;

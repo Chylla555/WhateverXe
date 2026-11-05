@@ -188,6 +188,7 @@ private:
 	bool display13FBWatermarkLayoutReady {false};
 	bool display13FBWatermarkHooksReady {false};
 	bool display13FBOutputHooksReady {false};
+	bool display13FBLinkConfigHookReady {false};
  bool display13FBSSTHooksReady {};
  bool display13FBAUXHooksReady {};
  mach_vm_address_t display13AUXControllerSlot {};
@@ -215,7 +216,8 @@ private:
  static bool display13StopTranscoder(void *port);
  static bool display13DeferClock(void *access,uint64_t reg,uint32_t value,uintptr_t caller);
 
- static uint8_t *display13SSTPort(void *port);
+ static uint8_t *display13SSTPort(void *port,bool unprobed=false);
+ static void display13SSTPortRecord(void *port,bool unprobed);
  static bool display13HDMIPort(void *port);
  static uint32_t wrapDisplay13TrainingPattern(void *path,uint32_t pattern);
  static uint32_t wrapDisplay13SignalLevels(void *port,uint32_t swing,uint32_t emphasis,void *overrideConfig);
@@ -341,7 +343,7 @@ private:
 	// Native start requires all generation-specific backend routes. These
 	// describe installed routes, not successful runtime ownership or scanout.
 	bool display13FBPowerBackendReady {false};
-	bool display13FBClockReady {false}, display13FBIRQReady {false}, display13FBMemoryReady {false}, display13FBABIReady {false};
+	bool display13FBClockReady {false}, display13FBIRQReady {false}, display13FBFlipSyncReady {false}, display13FBMemoryReady {false}, display13FBABIReady {false};
 	mach_vm_address_t orgAlderLakeNPowerReferences[7] {};
 	mach_vm_address_t orgAlderLakeNClockInit {}, orgAlderLakeNClockProbe {};
 	mach_vm_address_t orgAlderLakeNClockSet {};
@@ -469,6 +471,7 @@ private:
 	mach_vm_address_t adlnWorkLoopInGate {},adlnWorkLoopOnThread {};
 	mach_vm_address_t adlnWorkLoopTryClose {},adlnWorkLoopOpen {};
 	__attribute__((noinline)) bool processDisplay13FramebufferIRQ(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size);
+	__attribute__((noinline)) bool processDisplay13FramebufferFlipSync(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size);
 	static IOReturn wrapDisplay13FBEnableIRQ(IOService *controller);
 	static IOReturn wrapDisplay13FBDisableIRQ(IOService *controller);
 	static void wrapDisplay13FBConfigureVBL(IOService *controller,IOService *framebuffer,OSObject *path,bool enable,bool getLock);
